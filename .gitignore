@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+data.json
+data.json.bak
+data.json.tmp
+*.db
+*.sqlite*
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.log
+*.zip

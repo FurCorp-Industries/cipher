@@ -542,20 +542,9 @@ class BanModal(discord.ui.Modal, title="🔨 Bannir un membre"):
         if user_id is None:
             return await interaction.response.send_message("ID ou mention invalide.", ephemeral=True)
 
-        target_member = guild.get_member(user_id)
-        if target_member and (target_member.id == guild.owner_id or is_protected(target_member, guild)):
-            return await interaction.response.send_message(
-                t(guild.id, "ban_protected"),
-                ephemeral=True,
-            )
-
         raison = str(self.raison) or "Non précisée"
-        try:
-            await guild.ban(discord.Object(id=user_id), reason=f"{raison} (par {interaction.user})")
-        except discord.HTTPException as e:
-            return await interaction.response.send_message(f"❌ Erreur : {e}", ephemeral=True)
-        log_action(guild.id, f"{interaction.user} (Discord)", f"Membre {user_id} banni : {raison}")
-        await interaction.response.send_message(t(guild.id, "banned", user=user_id), ephemeral=True)
+        ok, msg = await perform_ban(guild, user_id, raison, str(interaction.user))
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -752,6 +741,71 @@ async def cmd_panel(interaction: discord.Interaction, public: bool = False):
     )
 
 
+# --------------------------------------------------------------------------- #
+# Modération "classique" : commandes au premier niveau, comme sur la plupart
+# des bots de modération. Elles réutilisent exactement la même logique que
+# /securite avertir/avertissements et que le bouton Bannir du panneau/site :
+# rien n'est dupliqué, ce sont juste des raccourcis plus rapides à taper.
+# --------------------------------------------------------------------------- #
+@bot.tree.command(name="ban", description="Bannir un membre (même s'il a déjà quitté le serveur)")
+@app_commands.describe(cible="Le membre à bannir", raison="Raison du bannissement")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def cmd_ban(interaction: discord.Interaction, cible: discord.User, raison: str = "Non précisée"):
+    if not is_trusted(interaction.user):
+        return await interaction.response.send_message(t(interaction.guild_id, "admin_only"), ephemeral=True)
+    ok, msg = await perform_ban(interaction.guild, cible.id, raison, str(interaction.user))
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="kick", description="Expulser un membre du serveur")
+@app_commands.describe(cible="Le membre à expulser", raison="Raison de l'expulsion")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def cmd_kick(interaction: discord.Interaction, cible: discord.Member, raison: str = "Non précisée"):
+    if not is_trusted(interaction.user):
+        return await interaction.response.send_message(t(interaction.guild_id, "admin_only"), ephemeral=True)
+    ok, msg = await perform_kick(cible, raison, str(interaction.user))
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="warn", description="Donner un avertissement à un membre (identique à /securite avertir)")
+@app_commands.describe(cible="Le membre à avertir", raison="Raison de l'avertissement")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def cmd_warn_top(interaction: discord.Interaction, cible: discord.Member, raison: str):
+    if not is_trusted(interaction.user):
+        return await interaction.response.send_message(t(interaction.guild_id, "admin_only"), ephemeral=True)
+    msg = await perform_warn(cible, raison, str(interaction.user))
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="seewarn", description="Voir les avertissements actifs d'un membre (identique à /securite avertissements)")
+@app_commands.describe(cible="Le membre à consulter")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def cmd_see_warn(interaction: discord.Interaction, cible: discord.Member):
+    if not is_trusted(interaction.user):
+        return await interaction.response.send_message(t(interaction.guild_id, "admin_only"), ephemeral=True)
+    await interaction.response.send_message(
+        perform_see_warnings(interaction.guild_id, cible.id, cible.mention), ephemeral=True
+    )
+
+
+@bot.tree.command(name="clearwarn", description="Effacer tous les avertissements d'un membre")
+@app_commands.describe(cible="Le membre concerné")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def cmd_clear_warn(interaction: discord.Interaction, cible: discord.Member):
+    if not is_trusted(interaction.user):
+        return await interaction.response.send_message(t(interaction.guild_id, "admin_only"), ephemeral=True)
+    count = perform_clear_warnings(interaction.guild_id, cible.id, str(interaction.user))
+    if count:
+        await interaction.response.send_message(f"🧹 {count} avertissement(s) effacé(s) pour {cible.mention}.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"{cible.mention} n'avait aucun avertissement.", ephemeral=True)
+
+
 MAX_MESSAGES = 300  # plafond de sécurité par commande
 SEND_DELAY = 1.2    # secondes entre deux messages (évite les limites de débit de Discord)
 
@@ -793,7 +847,10 @@ async def cmd_messages_send(
     for i in range(1, nombre + 1):
         content = texte.replace("\\n", "\n").replace("{n}", str(i))
         try:
-            await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+            await channel.send(
+                content,
+                allowed_mentions=discord.AllowedMentions(everyone=True, users=True, roles=True),
+            )
             sent += 1
         except discord.HTTPException:
             break
@@ -1044,6 +1101,64 @@ async def apply_warning_escalation(member: discord.Member, total: int) -> None:
             log_action(member.guild.id, "Bot (escalade auto)", f"{member} mute {conf['mute_minutes']} min après {total} avertissements")
         except discord.HTTPException:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# Modération "classique" : fonctions partagées (utilisées par /ban, /kick, /warn,
+# /clearwarn, /seewarn, /securite ..., le panneau ET le site web, pour qu'il n'y ait
+# jamais deux bouts de code différents qui font la même action).
+# --------------------------------------------------------------------------- #
+async def perform_ban(guild: discord.Guild, target_id: int, raison: str, actor_label: str) -> tuple[bool, str]:
+    target_member = guild.get_member(target_id)
+    if target_member and (target_member.id == guild.owner_id or is_protected(target_member, guild)):
+        return False, t(guild.id, "ban_protected")
+    try:
+        await guild.ban(discord.Object(id=target_id), reason=f"{raison} (par {actor_label})")
+    except discord.HTTPException as e:
+        return False, f"❌ Erreur : {e}"
+    log_action(guild.id, actor_label, f"Membre {target_id} banni : {raison}")
+    return True, t(guild.id, "banned", user=target_id)
+
+
+async def perform_kick(member: discord.Member, raison: str, actor_label: str) -> tuple[bool, str]:
+    guild = member.guild
+    if member.id == guild.owner_id or is_protected(member, guild):
+        return False, "⛔ Ce membre est protégé (propriétaire/admin/modérateur), impossible de l'expulser ainsi."
+    try:
+        await member.kick(reason=f"{raison} (par {actor_label})")
+    except discord.HTTPException as e:
+        return False, f"❌ Erreur : {e}"
+    log_action(guild.id, actor_label, f"{member} expulsé : {raison}")
+    return True, f"👢 {member.mention} expulsé."
+
+
+async def perform_warn(member: discord.Member, raison: str, actor_label: str) -> str:
+    total = add_warning(member.guild.id, member.id, raison, actor_label)
+    log_action(member.guild.id, actor_label, f"{member} averti ({total} actif(s)) : {raison}")
+    try:
+        await member.send(f"⚠️ Tu as reçu un avertissement sur **{member.guild.name}** : {raison}")
+    except discord.HTTPException:
+        pass
+    await apply_warning_escalation(member, total)
+    return t(member.guild.id, "warned", member=member.mention, total=total)
+
+
+def perform_see_warnings(guild_id: int, target_id: int, mention: str) -> str:
+    warns = active_warnings(guild_id, target_id)
+    if not warns:
+        return f"{mention} n'a aucun avertissement actif."
+    txt = "\n".join(f"- {w['ts']} par {w['by']} : {w['reason']}" for w in warns)
+    return f"**{len(warns)} avertissement(s) actif(s) pour {mention} :**\n{txt}"
+
+
+def perform_clear_warnings(guild_id: int, target_id: int, actor_label: str) -> int:
+    conf = guild_conf(guild_id)
+    count = len(conf["warnings"].get(str(target_id), []))
+    conf["warnings"][str(target_id)] = []
+    set_guild_conf(guild_id, conf)
+    if count:
+        log_action(guild_id, actor_label, f"Avertissements de l'utilisateur {target_id} effacés ({count})")
+    return count
 
 
 async def lockdown_guild(guild: discord.Guild, lock: bool, actor: str) -> int:
@@ -1408,28 +1523,18 @@ async def cmd_lockdown(interaction: discord.Interaction, activer: bool):
 @app_commands.describe(membre="Le membre à avertir", raison="Raison de l'avertissement")
 async def cmd_warn(interaction: discord.Interaction, membre: discord.Member, raison: str):
     if not is_trusted(interaction.user):
-        return await interaction.response.send_message("⛔ Réservé aux administrateurs.", ephemeral=True)
-    total = add_warning(interaction.guild_id, membre.id, raison, str(interaction.user))
-    log_action(interaction.guild_id, f"{interaction.user} (Discord)", f"{membre} averti ({total} total) : {raison}")
-    try:
-        await membre.send(f"⚠️ Tu as reçu un avertissement sur **{interaction.guild.name}** : {raison}")
-    except discord.HTTPException:
-        pass
-    await apply_warning_escalation(membre, total)
-    await interaction.response.send_message(t(interaction.guild_id, "warned", member=membre.mention, total=total), ephemeral=True)
+        return await interaction.response.send_message(t(interaction.guild_id, "admin_only"), ephemeral=True)
+    msg = await perform_warn(membre, raison, f"{interaction.user} (Discord)")
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @security_group.command(name="avertissements", description="Voir les avertissements d'un membre")
 @app_commands.describe(membre="Le membre à consulter")
 async def cmd_warnings(interaction: discord.Interaction, membre: discord.Member):
     if not is_trusted(interaction.user):
-        return await interaction.response.send_message("⛔ Réservé aux administrateurs.", ephemeral=True)
-    warns = active_warnings(interaction.guild_id, membre.id)
-    if not warns:
-        return await interaction.response.send_message(f"{membre.mention} n'a aucun avertissement actif.", ephemeral=True)
-    txt = "\n".join(f"- {w['ts']} par {w['by']} : {w['reason']}" for w in warns)
+        return await interaction.response.send_message(t(interaction.guild_id, "admin_only"), ephemeral=True)
     await interaction.response.send_message(
-        f"**{len(warns)} avertissement(s) actif(s) pour {membre.mention} :**\n{txt}", ephemeral=True
+        perform_see_warnings(interaction.guild_id, membre.id, membre.mention), ephemeral=True
     )
 
 
@@ -1566,8 +1671,32 @@ bot.tree.add_command(security_group)
 # --------------------------------------------------------------------------- #
 # Nouveautés du bot
 # --------------------------------------------------------------------------- #
-BOT_VERSION = "1.6"
+BOT_VERSION = "1.9"
 CHANGELOG = [
+    {
+        "version": "1.9",
+        "date": "26/11/2026",
+        "items": [
+            "📨 Site web : DM tous les membres avec un message personnalisable ({member}, {server}...), mode test, annulation",
+        ],
+    },
+    {
+        "version": "1.8",
+        "date": "22/11/2026",
+        "items": [
+            "📣 /messages envoyer : @everyone et les mentions fonctionnent enfin (Discord et site web)",
+            "🎭 Gestion des rôles (donner/retirer) disponible sur le site web, pas que sur Discord",
+        ],
+    },
+    {
+        "version": "1.7",
+        "date": "22/11/2026",
+        "items": [
+            "⚖️ Commandes de modération classiques : /ban, /kick, /warn, /seewarn, /clearwarn",
+            "🧹 /clearwarn : effacer tous les avertissements d'un membre",
+            "🔧 Ban/kick/warn consolidés en un seul endroit en coulisses (panneau, site, commandes)",
+        ],
+    },
     {
         "version": "1.6",
         "date": "22/11/2026",
@@ -1659,6 +1788,11 @@ async def cmd_help(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
+        name="⚖️ Modération classique",
+        value="`/ban` · `/kick` · `/warn` · `/seewarn` · `/clearwarn`",
+        inline=False,
+    )
+    embed.add_field(
         name="🛡️ Sécurité",
         value=(
             "`/securite configurer/statut/lockdown/avertir/avertissements/mute/demute`\n"
@@ -1744,6 +1878,23 @@ async def cmd_ticket_list(interaction: discord.Interaction):
 # --------------------------------------------------------------------------- #
 # Gestion des rôles
 # --------------------------------------------------------------------------- #
+async def perform_role_change(member: discord.Member, role: discord.Role, add: bool, actor_label: str) -> tuple[bool, str]:
+    """Donne ou retire un rôle. Utilisé par /role, le site web, et tout futur appelant : un seul endroit à corriger."""
+    guild = member.guild
+    if role >= guild.me.top_role:
+        return False, f"⛔ Je ne peux pas gérer le rôle {role.mention} (il est trop haut dans la hiérarchie par rapport à mon propre rôle)."
+    try:
+        if add:
+            await member.add_roles(role, reason=f"Ajouté par {actor_label}")
+        else:
+            await member.remove_roles(role, reason=f"Retiré par {actor_label}")
+    except discord.HTTPException as e:
+        return False, f"❌ Erreur : {e}"
+    verbe = "donné à" if add else "retiré à"
+    log_action(guild.id, actor_label, f"Rôle {role.name} {'donné à' if add else 'retiré de'} {member}")
+    return True, f"✅ {role.mention} {verbe} {member.mention}."
+
+
 role_group = app_commands.Group(
     name="role",
     description="Gérer les rôles des membres",
@@ -1756,26 +1907,18 @@ role_group = app_commands.Group(
 @app_commands.describe(membre="Le membre concerné", role="Le rôle à donner")
 async def cmd_role_add(interaction: discord.Interaction, membre: discord.Member, role: discord.Role):
     if not is_trusted(interaction.user):
-        return await interaction.response.send_message("⛔ Réservé aux administrateurs.", ephemeral=True)
-    try:
-        await membre.add_roles(role, reason=f"Ajouté par {interaction.user}")
-    except discord.HTTPException as e:
-        return await interaction.response.send_message(f"❌ Erreur : {e}", ephemeral=True)
-    log_action(interaction.guild_id, f"{interaction.user} (Discord)", f"Rôle {role.name} donné à {membre}")
-    await interaction.response.send_message(f"✅ {role.mention} donné à {membre.mention}.", ephemeral=True)
+        return await interaction.response.send_message(t(interaction.guild_id, "admin_only"), ephemeral=True)
+    ok, msg = await perform_role_change(membre, role, True, str(interaction.user))
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @role_group.command(name="retirer", description="Retirer un rôle à un membre")
 @app_commands.describe(membre="Le membre concerné", role="Le rôle à retirer")
 async def cmd_role_remove(interaction: discord.Interaction, membre: discord.Member, role: discord.Role):
     if not is_trusted(interaction.user):
-        return await interaction.response.send_message("⛔ Réservé aux administrateurs.", ephemeral=True)
-    try:
-        await membre.remove_roles(role, reason=f"Retiré par {interaction.user}")
-    except discord.HTTPException as e:
-        return await interaction.response.send_message(f"❌ Erreur : {e}", ephemeral=True)
-    log_action(interaction.guild_id, f"{interaction.user} (Discord)", f"Rôle {role.name} retiré à {membre}")
-    await interaction.response.send_message(f"✅ {role.mention} retiré à {membre.mention}.", ephemeral=True)
+        return await interaction.response.send_message(t(interaction.guild_id, "admin_only"), ephemeral=True)
+    ok, msg = await perform_role_change(membre, role, False, str(interaction.user))
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @role_group.command(name="auto", description="Donner automatiquement un rôle aux nouveaux membres")
@@ -2285,8 +2428,6 @@ def render(body: str, guild=None, flash: str = "", flash_err: bool = False):
     if not csrf_token:
         csrf_token = secrets.token_urlsafe(32)
         session["csrf_token"] = csrf_token
-    # Toutes les pages du tableau utilisent des formulaires HTML simples. On
-    # ajoute le jeton à chacun ici pour ne pas oublier une action sensible.
     body = re.sub(
         r"(<form\b[^>]*\bmethod=['\"]post['\"][^>]*>)",
         rf'\1<input type="hidden" name="csrf_token" value="{csrf_token}">',
@@ -2311,6 +2452,67 @@ def call_bot(coro):
     """Exécute une coroutine du bot depuis une requête web (thread séparé) et attend le résultat."""
     fut = asyncio.run_coroutine_threadsafe(coro, bot.loop)
     return fut.result(timeout=120)
+
+
+# --------------------------------------------------------------------------- #
+# DM de masse (depuis le site web uniquement)
+# --------------------------------------------------------------------------- #
+DM_DELAY = 2.0            # secondes entre deux MP : lent exprès pour limiter le risque de blocage par Discord
+DM_STOP_CODES = {40003, 20026}  # 40003 = trop d'ouvertures de MP trop vite ; 20026 = le bot est signalé comme spammeur
+_dm_jobs: dict[int, dict] = {}  # guild_id -> état de l'envoi en cours / du dernier envoi
+
+
+def render_dm_text(template: str, guild: discord.Guild, member: discord.abc.User) -> str:
+    """Remplace {member}, {mention}, {server}, {date}, {members} (sans planter si le texte contient d'autres accolades)."""
+    values = {
+        "{member}": getattr(member, "display_name", member.name),
+        "{mention}": member.mention,
+        "{server}": guild.name,
+        "{date}": datetime.now().strftime("%d/%m/%Y"),
+        "{members}": str(guild.member_count),
+    }
+    for key, val in values.items():
+        template = template.replace(key, val)
+    return template[:2000]
+
+
+async def perform_dm_all(guild: discord.Guild, template: str, actor_label: str) -> None:
+    """Envoie un MP personnalisé à tous les membres (hors bots), lentement, avec arrêt de sécurité."""
+    job = _dm_jobs[guild.id]
+    try:
+        async for member in guild.fetch_members(limit=None):
+            if member.bot:
+                continue
+            if job["cancel"]:
+                job["status"] = "annulé"
+                break
+            job["total"] += 1
+            try:
+                await member.send(
+                    render_dm_text(template, guild, member),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                job["sent"] += 1
+            except discord.Forbidden as e:
+                if e.code in DM_STOP_CODES:
+                    job["status"] = f"arrêté par sécurité (Discord a refusé : code {e.code})"
+                    break
+                job["failed"] += 1  # MP fermés : cas normal
+            except discord.HTTPException as e:
+                if e.code in DM_STOP_CODES:
+                    job["status"] = f"arrêté par sécurité (Discord a refusé : code {e.code})"
+                    break
+                job["failed"] += 1
+            await asyncio.sleep(DM_DELAY)
+        else:
+            job["status"] = "terminé"
+    except Exception as e:
+        job["status"] = f"erreur : {e}"
+    job["running"] = False
+    log_action(
+        guild.id, actor_label,
+        f"DM de masse {job['status']} — {job['sent']} envoyé(s), {job['failed']} échec(s) (MP fermés), {job['total']} membre(s) traité(s)",
+    )
 
 
 def login_required(f):
@@ -2412,6 +2614,25 @@ def guild_page(guild_id):
         for m in sorted(guild.members, key=lambda m: m.display_name.lower())
         if not is_protected(m, guild)
     )
+    role_options = "".join(
+        f"<option value='{r.id}'>{r.name}</option>"
+        for r in sorted(guild.roles, key=lambda r: r.position, reverse=True)
+        if not r.is_default() and not r.managed and r < guild.me.top_role
+    )
+
+    job = _dm_jobs.get(guild_id)
+    dm_status_html = ""
+    if job:
+        dm_status_html = (
+            f"<div class='flash'>Dernier envoi : <b>{job['status']}</b> — {job['sent']} envoyé(s), "
+            f"{job['failed']} échec(s), {job['total']} traité(s)."
+        )
+        if job["running"]:
+            dm_status_html += (
+                f" (recharge la page pour actualiser) <form method='post' style='display:inline' "
+                f"action='{url_for('guild_dmall_cancel', guild_id=guild_id)}'><button class='danger'>Annuler</button></form>"
+            )
+        dm_status_html += "</div>"
 
     body = f"""
     <h1>{guild.name}</h1>
@@ -2448,6 +2669,18 @@ def guild_page(guild_id):
       <button>Envoyer</button>
     </form></div>
 
+    <div class='card'><h3>🎭 Gérer les rôles</h3>
+    <form method='post' action='{url_for('guild_role_change', guild_id=guild_id)}'>
+      <label>Membre</label><select name='membre' required>{member_options}</select>
+      <label>Rôle</label><select name='role' required>{role_options}</select>
+      <label>Action</label>
+      <select name='action'>
+        <option value='add'>Donner le rôle</option>
+        <option value='remove'>Retirer le rôle</option>
+      </select>
+      <button>Appliquer</button>
+    </form></div>
+
     <div class='card'><h3>🔨 Bannir un membre</h3>
     <form method='post' action='{url_for('guild_ban', guild_id=guild_id)}'
           onsubmit="return confirm('Bannir ce membre ?');">
@@ -2463,6 +2696,26 @@ def guild_page(guild_id):
       <button class='danger'>Trouver et expulser/bannir</button>
     </form></div>
 
+    <div class='card'><h3>📨 DM tous les membres</h3>
+    <p class='muted'>Envoie un message privé à tous les membres (bots exclus). Variables : {{member}} (pseudo),
+    {{mention}}, {{server}}, {{date}}, {{members}}. Envoi lent ({DM_DELAY:g} s par membre) : compte environ
+    {int(guild.member_count * DM_DELAY / 60) + 1} min pour ce serveur. Les membres avec les MP fermés sont ignorés.</p>
+    <p class='muted'>⚠️ Les MP de masse non sollicités sont contraires aux règles de Discord et peuvent faire
+    restreindre ou bannir le bot. Utilise-le avec parcimonie (annonce importante).</p>
+    {dm_status_html}
+    <form method='post' action='{url_for('guild_dmall', guild_id=guild_id)}'
+          onsubmit="return this.mode.value === 'test' || confirm('Envoyer ce message en MP à TOUS les membres du serveur ?');">
+      <label>Message</label>
+      <textarea name='texte' rows='5' required placeholder='Salut {{member}}, ...'></textarea>
+      <label>Mode</label>
+      <select name='mode'>
+        <option value='test'>Test : m'envoyer le message à moi seul</option>
+        <option value='all'>Envoyer à tous les membres</option>
+      </select>
+      <label>Pour envoyer à tous, écris CONFIRMER</label><input name='confirm' autocomplete='off'>
+      <button class='danger'>Envoyer</button>
+    </form></div>
+
     <div class='card'><h3>🚀 Lancer la restructuration</h3>
     <p class='muted'>⚠️ Action irréversible : supprime tous les salons (et les rôles si choisi), puis crée les salons temporaires.</p>
     <form method='post' action='{url_for('guild_launch', guild_id=guild_id)}'
@@ -2476,25 +2729,30 @@ def guild_page(guild_id):
     return render(body, guild=guild)
 
 
+@app.route("/guild/<int:guild_id>/role", methods=["POST"])
+@login_required
+def guild_role_change(guild_id):
+    guild = get_authorized_guild(guild_id)
+    membre = guild.get_member(int(request.form["membre"]))
+    role = guild.get_role(int(request.form["role"]))
+    add = request.form.get("action") == "add"
+    if membre is None or role is None:
+        abort(400, "Membre ou rôle introuvable.")
+    ok, msg = call_bot(perform_role_change(membre, role, add, f"{session['username']} (via le site)"))
+    if not ok:
+        abort(400, msg)
+    return redirect(url_for("guild_page", guild_id=guild_id))
+
+
 @app.route("/guild/<int:guild_id>/ban", methods=["POST"])
 @login_required
 def guild_ban(guild_id):
     guild = get_authorized_guild(guild_id)
     membre_id = int(request.form["membre"])
     raison = request.form.get("raison", "").strip() or "Non précisée"
-
-    target_member = guild.get_member(membre_id)
-    if target_member and (target_member.id == guild.owner_id or is_protected(target_member, guild)):
-        abort(403, "Ce membre est protégé, impossible de le bannir ainsi.")
-
-    async def _ban():
-        await guild.ban(discord.Object(id=membre_id), reason=f"{raison} (par {session['username']} via le site)")
-
-    try:
-        call_bot(_ban())
-    except Exception as e:
-        abort(400, f"Erreur lors du bannissement : {e}")
-    log_action(guild_id, f"{session['username']} (Site web)", f"Membre {membre_id} banni : {raison}")
+    ok, msg = call_bot(perform_ban(guild, membre_id, raison, f"{session['username']} (via le site)"))
+    if not ok:
+        abort(400, msg)
     return redirect(url_for("guild_page", guild_id=guild_id))
 
 
@@ -2581,7 +2839,10 @@ def guild_messages_send(guild_id):
         for i in range(1, nombre + 1):
             content = texte.replace("\\n", "\n").replace("{n}", str(i))
             try:
-                await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+                await channel.send(
+                    content,
+                    allowed_mentions=discord.AllowedMentions(everyone=True, users=True, roles=True),
+                )
                 sent += 1
             except discord.HTTPException:
                 break
@@ -2590,6 +2851,48 @@ def guild_messages_send(guild_id):
 
     sent = call_bot(_send())
     log_action(guild_id, f"{session['username']} (Site web)", f"{sent} message(s) envoyés dans #{channel.name}")
+    return redirect(url_for("guild_page", guild_id=guild_id))
+
+
+@app.route("/guild/<int:guild_id>/dmall", methods=["POST"])
+@login_required
+def guild_dmall(guild_id):
+    guild = get_authorized_guild(guild_id)
+    texte = request.form.get("texte", "").strip()
+    if not texte:
+        abort(400, "Message vide.")
+    actor = f"{session['username']} (Site web)"
+
+    if request.form.get("mode") == "test":
+        async def _test():
+            user = await bot.fetch_user(session["user_id"])
+            await user.send("🧪 **Test** — " + render_dm_text(texte, guild, user)[:1980],
+                            allowed_mentions=discord.AllowedMentions.none())
+        try:
+            call_bot(_test())
+        except Exception as e:
+            abort(400, f"Impossible de t'envoyer le MP de test (tes MP sont peut-être fermés) : {e}")
+        return redirect(url_for("guild_page", guild_id=guild_id))
+
+    if request.form.get("confirm", "").strip().upper() != "CONFIRMER":
+        abort(400, "Écris CONFIRMER pour envoyer à tous les membres.")
+    if _dm_jobs.get(guild_id, {}).get("running"):
+        abort(400, "Un envoi est déjà en cours sur ce serveur.")
+
+    _dm_jobs[guild_id] = {"running": True, "cancel": False, "status": "en cours", "sent": 0, "failed": 0, "total": 0}
+    log_action(guild_id, actor, "DM de masse lancé")
+    # Pas de call_bot ici : l'envoi dure plusieurs minutes, on le lance en tâche de fond.
+    asyncio.run_coroutine_threadsafe(perform_dm_all(guild, texte, actor), bot.loop)
+    return redirect(url_for("guild_page", guild_id=guild_id))
+
+
+@app.route("/guild/<int:guild_id>/dmall/cancel", methods=["POST"])
+@login_required
+def guild_dmall_cancel(guild_id):
+    get_authorized_guild(guild_id)
+    job = _dm_jobs.get(guild_id)
+    if job and job["running"]:
+        job["cancel"] = True
     return redirect(url_for("guild_page", guild_id=guild_id))
 
 

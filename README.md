@@ -2,7 +2,9 @@
 
 Bot Discord autonome de restructuration, modération, sécurité, tickets, rôles, niveaux, rappels et sondages. Il fonctionne séparément de `onepiece-bot` : il utilise son propre token, ses propres données (`data.json`) et son service `cipher-bot`.
 
-Le tableau web intégré reprend les fonctions web du bot : gestion des serveurs autorisés, messages de restructuration, salons temporaires, annonces, envoi de messages, bannissement, inactifs, restructuration, journaux et paramètres de sécurité.
+Le tableau web intégré reprend les fonctions web du bot : gestion des serveurs autorisés, messages de restructuration, salons temporaires, annonces, rôles, bannissement, inactifs, messages privés de masse avec annulation, restructuration, journaux et paramètres de sécurité.
+
+La version actuelle ajoute également les commandes de modération directes `/ban`, `/kick`, `/warn`, `/seewarn` et `/clearwarn`.
 
 ## Déploiement
 

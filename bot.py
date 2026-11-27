@@ -51,6 +51,10 @@ FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "")
 DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8091"))
 
+# La boucle Discord appartient au thread principal. Le tableau web tourne dans
+# un autre thread et doit toujours soumettre ses actions à cette boucle précise.
+BOT_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
+
 
 def ids_from_env(name: str) -> set[int]:
     """Lit des IDs Discord séparés par des virgules sans les inscrire dans le code."""
@@ -260,7 +264,7 @@ def log_action(guild_id: int, actor: str, action: str) -> None:
         channel = guild.get_channel(channel_id) if guild else None
         if channel is not None:
             try:
-                asyncio.run_coroutine_threadsafe(channel.send(f"📝 **{actor}** : {action}"), bot.loop)
+                submit_bot_task(channel.send(f"📝 **{actor}** : {action}"))
             except Exception:
                 pass
 
@@ -724,6 +728,8 @@ class RestructureBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        global BOT_EVENT_LOOP
+        BOT_EVENT_LOOP = asyncio.get_running_loop()
         self.add_view(PanelView())        # les boutons restent actifs après un redémarrage
         self.add_view(VerifyView())
         self.add_view(TicketPanelView())
@@ -2472,10 +2478,22 @@ def check_csrf():
         abort(400, "Requête invalide ou expirée. Recharge la page et réessaie.")
 
 
+def submit_bot_task(coro):
+    """Planifie une action du site sur la boucle asynchrone réellement utilisée par Discord."""
+    if BOT_EVENT_LOOP is None or not BOT_EVENT_LOOP.is_running():
+        coro.close()
+        raise RuntimeError("Le bot Discord n'est pas encore prêt. Réessaie dans quelques secondes.")
+    return asyncio.run_coroutine_threadsafe(coro, BOT_EVENT_LOOP)
+
+
 def call_bot(coro):
-    """Exécute une coroutine du bot depuis une requête web (thread séparé) et attend le résultat."""
-    fut = asyncio.run_coroutine_threadsafe(coro, bot.loop)
-    return fut.result(timeout=120)
+    """Exécute une coroutine du bot depuis une requête web et attend son résultat."""
+    fut = submit_bot_task(coro)
+    try:
+        return fut.result(timeout=45)
+    except TimeoutError as exc:
+        fut.cancel()
+        raise TimeoutError("Discord ne répond pas assez vite. Réessaie dans quelques secondes.") from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -2895,7 +2913,10 @@ def guild_messages_send(guild_id):
             await asyncio.sleep(SEND_DELAY)
         return sent
 
-    sent = call_bot(_send())
+    try:
+        sent = call_bot(_send())
+    except (RuntimeError, TimeoutError) as exc:
+        abort(503, str(exc))
     log_action(guild_id, f"{session['username']} (Site web)", f"{sent} message(s) envoyés dans #{channel.name}")
     return redirect(url_for("guild_page", guild_id=guild_id))
 
@@ -2928,7 +2949,7 @@ def guild_dmall(guild_id):
     _dm_jobs[guild_id] = {"running": True, "cancel": False, "status": "en cours", "sent": 0, "failed": 0, "total": 0}
     log_action(guild_id, actor, "DM de masse lancé")
     # Pas de call_bot ici : l'envoi dure plusieurs minutes, on le lance en tâche de fond.
-    asyncio.run_coroutine_threadsafe(perform_dm_all(guild, texte, actor), bot.loop)
+    submit_bot_task(perform_dm_all(guild, texte, actor))
     return redirect(url_for("guild_page", guild_id=guild_id))
 
 

@@ -3059,6 +3059,14 @@ _dashboard_started = False
 async def on_ready():
     global _dashboard_started
     print(f"Connecté en tant que {bot.user} ({len(bot.guilds)} serveurs)")
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name="la sécurité des serveurs",
+        ),
+    )
+    print("Présence Discord définie sur En ligne.")
     if not _dashboard_started:
         _dashboard_started = True
         threading.Thread(target=run_dashboard, daemon=True).start()

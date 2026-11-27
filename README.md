@@ -6,6 +6,13 @@ Le tableau web intégré reprend les fonctions web du bot : gestion des serveurs
 
 La version actuelle ajoute également les commandes de modération directes `/ban`, `/kick`, `/warn`, `/seewarn` et `/clearwarn`.
 
+## Système de niveaux
+
+Les administrateurs peuvent activer ou couper les nouveaux gains d'XP avec
+`/leveling actif:True` ou `/leveling actif:False`. Les XP et le classement déjà
+enregistrés ne sont jamais supprimés. Le même réglage est disponible dans le
+tableau web, sur la page du serveur.
+
 ## Déploiement
 
 1. Crée une seconde application/bot dans le portail Discord et active les intents **Server Members** et **Message Content**.

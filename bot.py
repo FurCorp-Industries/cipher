@@ -240,6 +240,9 @@ def guild_conf(guild_id: int) -> dict:
     conf.setdefault("temp_roles", [])
     conf.setdefault("role_reactions", {})
     conf.setdefault("log_channel_id", None)
+    # Désactiver le leveling stoppe uniquement les nouveaux gains d'XP : les
+    # niveaux et le classement déjà enregistrés restent disponibles.
+    conf.setdefault("leveling_enabled", True)
     conf.setdefault("leveling_announce", True)
     conf.setdefault("lang", "fr")
     return conf
@@ -292,7 +295,9 @@ def touch_activity(guild_id: int, user_id: int) -> bool:
 
     leveled_up = False
     last_xp = datetime.fromisoformat(entry["last_xp"]) if entry.get("last_xp") else None
-    if last_xp is None or (now - last_xp).total_seconds() >= XP_COOLDOWN_SECONDS:
+    if conf.get("leveling_enabled", True) and (
+        last_xp is None or (now - last_xp).total_seconds() >= XP_COOLDOWN_SECONDS
+    ):
         old_level = entry["xp"] // 100
         entry["xp"] += XP_PAR_MESSAGE
         entry["last_xp"] = now.isoformat()
@@ -2142,6 +2147,25 @@ async def cmd_level(interaction: discord.Interaction, membre: discord.Member | N
     await interaction.response.send_message(t(interaction.guild_id, "level_card", member=target.mention, level=xp // 100, xp=xp))
 
 
+@bot.tree.command(name="leveling", description="Activer ou désactiver les gains d'XP du serveur")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(actif="True pour activer les gains d'XP, False pour les arrêter")
+async def cmd_leveling(interaction: discord.Interaction, actif: bool):
+    """Bascule les nouveaux gains d'XP sans effacer le classement existant."""
+    if not is_trusted(interaction.user):
+        return await interaction.response.send_message("⛔ Réservé aux administrateurs.", ephemeral=True)
+    conf = guild_conf(interaction.guild_id)
+    conf["leveling_enabled"] = actif
+    set_guild_conf(interaction.guild_id, conf)
+    state = "activé" if actif else "désactivé"
+    log_action(interaction.guild_id, f"{interaction.user} (Discord)", f"Système de niveaux {state}")
+    await interaction.response.send_message(
+        f"✅ Système de niveaux {state}. "
+        "Les XP déjà obtenus sont conservés.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="classement", description="Voir le classement XP du serveur")
 async def cmd_leaderboard(interaction: discord.Interaction):
     activity = guild_conf(interaction.guild_id).get("activity", {})
@@ -2696,6 +2720,15 @@ def guild_page(guild_id):
       <button class='danger'>Trouver et expulser/bannir</button>
     </form></div>
 
+    <div class='card'><h3>📈 Système de niveaux</h3>
+    <p class='muted'>État actuel : <b>{"activé" if conf.get("leveling_enabled", True) else "désactivé"}</b>.
+    Désactiver le système arrête les nouveaux gains d'XP, sans effacer les niveaux existants.</p>
+    <form method='post' action='{url_for('guild_leveling_save', guild_id=guild_id)}'>
+      <label><input type='checkbox' name='leveling_enabled' {"checked" if conf.get("leveling_enabled", True) else ""} style='width:auto;display:inline'> Activer les gains d'XP</label>
+      <label><input type='checkbox' name='leveling_announce' {"checked" if conf.get("leveling_announce", True) else ""} style='width:auto;display:inline'> Annoncer les passages de niveau</label>
+      <button>Enregistrer</button>
+    </form></div>
+
     <div class='card'><h3>📨 DM tous les membres</h3>
     <p class='muted'>Envoie un message privé à tous les membres (bots exclus). Variables : {{member}} (pseudo),
     {{mention}}, {{server}}, {{date}}, {{members}}. Envoi lent ({DM_DELAY:g} s par membre) : compte environ
@@ -2727,6 +2760,19 @@ def guild_page(guild_id):
     </form></div>
     """
     return render(body, guild=guild)
+
+
+@app.route("/guild/<int:guild_id>/leveling", methods=["POST"])
+@login_required
+def guild_leveling_save(guild_id):
+    guild = get_authorized_guild(guild_id)
+    conf = guild_conf(guild_id)
+    conf["leveling_enabled"] = "leveling_enabled" in request.form
+    conf["leveling_announce"] = "leveling_announce" in request.form
+    set_guild_conf(guild_id, conf)
+    state = "activé" if conf["leveling_enabled"] else "désactivé"
+    log_action(guild_id, f"{session['username']} (Site web)", f"Système de niveaux {state}")
+    return redirect(url_for("guild_page", guild_id=guild_id))
 
 
 @app.route("/guild/<int:guild_id>/role", methods=["POST"])

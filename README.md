@@ -17,13 +17,19 @@ Ne copie jamais `start.bat`, `data.json` ni les secrets provenant de l'archive d
 
 ## Commandes serveur
 
-Après avoir cloné ce dépôt dans `/home/ubuntu/cipher-bot`, exécute :
+Après avoir cloné ou décompressé ce dépôt dans le dossier de ton choix (par exemple `/home/ubuntu/cipher`), exécute :
 
 ```bash
-cd /home/ubuntu/cipher-bot
+cd /home/ubuntu/cipher
 cp .env.example .env
 nano .env
 bash deploy/setup-server.sh
+```
+
+Avant de lancer Certbot, crée un enregistrement DNS **A** pour `cipher.lefleau.online` pointant vers l'IP publique du serveur. Une fois cette propagation vérifiée, lance :
+
+```bash
+dig +short cipher.lefleau.online
 sudo certbot --nginx -d cipher.lefleau.online
 ```
 

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR=/home/ubuntu/cipher-bot
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+UNIT_FILE="$(mktemp)"
+trap 'rm -f "$UNIT_FILE"' EXIT
 
 cd "$APP_DIR"
 
@@ -15,7 +18,8 @@ python3 -m venv venv
 venv/bin/pip install --upgrade pip
 venv/bin/pip install -r requirements.txt
 
-sudo install -m 644 deploy/cipher-bot.service /etc/systemd/system/cipher-bot.service
+sed "s|/home/ubuntu/cipher-bot|$APP_DIR|g" deploy/cipher-bot.service > "$UNIT_FILE"
+sudo install -m 644 "$UNIT_FILE" /etc/systemd/system/cipher-bot.service
 sudo install -m 644 deploy/cipher.lefleau.online.conf /etc/nginx/sites-available/cipher.lefleau.online
 sudo ln -sfn /etc/nginx/sites-available/cipher.lefleau.online /etc/nginx/sites-enabled/cipher.lefleau.online
 sudo nginx -t
